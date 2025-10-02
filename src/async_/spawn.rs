@@ -1,134 +1,134 @@
-use alloc::collections::vec_deque::VecDeque;
-use core::cell::UnsafeCell;
+extern crate std;
+
+use core::ffi::c_int;
+use core::{mem, ptr};
+use std::sync::OnceLock;
+
 use core::future::Future;
-use core::mem;
-use core::ptr::{self, NonNull};
 
 pub use async_task::Task;
 use async_task::{Runnable, ScheduleInfo, WithInfo};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use nginx_sys::{
-    ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event, ngx_posted_next_events,
+    ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event, ngx_posted_events,
+    pthread_kill, pthread_self, pthread_t, SIGIO,
 };
 
 use crate::log::ngx_cycle_log;
-use crate::{ngx_container_of, ngx_log_debug};
+use crate::ngx_log_debug;
+use crate::sync::RwLock;
 
-static SCHEDULER: Scheduler = Scheduler::new();
+static MAIN_THREAD: OnceLock<pthread_t> = OnceLock::new();
 
-struct Scheduler(UnsafeCell<SchedulerInner>);
+/// Initialize async by storing MAIN_THREAD
+pub fn initialize_async() {
+    MAIN_THREAD
+        .set(unsafe { pthread_self() })
+        .expect("async: double initialize")
+}
 
-// SAFETY: Scheduler must only be used from the main thread of a worker process.
+#[inline]
+fn on_event_thread() -> bool {
+    *MAIN_THREAD.get().expect("async: not initialized") == unsafe { pthread_self() }
+}
+
+extern "C" fn async_handler(ev: *mut ngx_event_t) {
+    let scheduler = scheduler();
+    let mut cnt = 0;
+    while let Ok(r) = scheduler.rx.try_recv() {
+        r.run();
+        cnt += 1;
+    }
+    ngx_log_debug!(
+        unsafe { (*ev).log },
+        "async: notify_handler processed {cnt} items"
+    );
+}
+
+fn notify() -> c_int {
+    ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: ngx_notify");
+    unsafe {
+        pthread_kill(
+            *MAIN_THREAD.get().expect("async: not initialized"),
+            SIGIO.try_into().unwrap(),
+        )
+    }
+}
+
+struct Scheduler {
+    rx: Receiver<Runnable>,
+    tx: Sender<Runnable>,
+    event: RwLock<ngx_event_t>,
+}
+
+// Safety: mutable access to event is guarded via RwLock
 unsafe impl Send for Scheduler {}
 unsafe impl Sync for Scheduler {}
 
 impl Scheduler {
-    const fn new() -> Self {
-        Self(SchedulerInner::new())
-    }
-
-    pub fn schedule(&self, runnable: Runnable) {
-        // SAFETY: the cell is not empty, and we have exclusive access due to being a
-        // single-threaded application.
-        let inner = unsafe { &mut *UnsafeCell::raw_get(&self.0) };
-        inner.send(runnable)
-    }
-}
-
-#[repr(C)]
-struct SchedulerInner {
-    _ident: [usize; 4], // `ngx_event_ident` compatibility
-    event: ngx_event_t,
-    queue: VecDeque<Runnable>,
-}
-
-impl SchedulerInner {
-    const fn new() -> UnsafeCell<Self> {
+    fn new() -> Self {
+        let (tx, rx) = unbounded();
         let mut event: ngx_event_t = unsafe { mem::zeroed() };
-        event.handler = Some(Self::scheduler_event_handler);
+        event.handler = Some(async_handler);
+        event.log = ngx_cycle_log().as_ptr();
+        let event = RwLock::new(event);
 
-        UnsafeCell::new(Self {
-            _ident: [
-                0, 0, 0, 0x4153594e, // ASYN
-            ],
-            event,
-            queue: VecDeque::new(),
-        })
+        Scheduler { tx, rx, event }
     }
 
-    pub fn send(&mut self, runnable: Runnable) {
-        // Cached `ngx_cycle.log` can be invalidated when reloading configuration in a single
-        // process mode. Update `log` every time to avoid using stale log pointer.
-        self.event.log = ngx_cycle_log().as_ptr();
-
-        // While this event is not used as a timer at the moment, we still want to ensure that it is
-        // compatible with `ngx_event_ident`.
-        if self.event.data.is_null() {
-            self.event.data = ptr::from_mut(self).cast();
-        }
-
-        // FIXME: VecDeque::push could panic on an allocation failure, switch to a datastructure
-        // which will not and propagate the failure.
-        self.queue.push_back(runnable);
-        unsafe { ngx_post_event(&mut self.event, ptr::addr_of_mut!(ngx_posted_next_events)) }
-    }
-
-    /// This event handler is called by ngx_event_process_posted at the end of
-    /// ngx_process_events_and_timers.
-    extern "C" fn scheduler_event_handler(ev: *mut ngx_event_t) {
-        let mut runnables = {
-            // SAFETY:
-            // This handler always receives a non-null pointer to an event embedded into a
-            // UnsafeCell<SchedulerInner> instance. We modify the contents of the `UnsafeCell`,
-            // but we ensured that:
-            //  - we access the cell correctly, as documented in
-            //    https://doc.rust-lang.org/stable/std/cell/struct.UnsafeCell.html#memory-layout
-            //  - the access is unique due to being single-threaded
-            //  - the reference is dropped before we start processing queued runnables.
-            let cell: NonNull<UnsafeCell<Self>> =
-                unsafe { ngx_container_of!(NonNull::new_unchecked(ev), Self, event).cast() };
-            let this = unsafe { &mut *UnsafeCell::raw_get(cell.as_ptr()) };
-
-            ngx_log_debug!(
-                this.event.log,
-                "async: processing {} deferred wakeups",
-                this.queue.len()
-            );
-
-            // Move runnables to a new queue to avoid borrowing from the SchedulerInner and limit
-            // processing to already queued wakeups. This ensures that we correctly handle tasks
-            // that keep scheduling themselves (e.g. using yield_now() in a loop).
-            // We can't use drain() as it borrows from self and breaks aliasing rules.
-            mem::take(&mut this.queue)
-        };
-
-        for runnable in runnables.drain(..) {
+    fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
+        let oet = on_event_thread();
+        // If we are on the event loop thread it's safe to simply run the Runnable, otherwise we
+        // enqueue the Runnable, post our event, and SIGIO to interrupt epoll. The event handler
+        // then runs the Runnable on the event loop thread.
+        //
+        // If woken_while_running, it indicates that a task has yielded itself to the Scheduler.
+        // Force round-trip via queue to limit reentrancy (skipping SIGIO).
+        if oet && !info.woken_while_running {
             runnable.run();
+        } else {
+            self.tx.send(runnable).expect("send");
+            {
+                let mut event = self.event.write();
+                event.log = ngx_cycle_log().as_ptr();
+
+                unsafe {
+                    ngx_post_event(&mut *event, ptr::addr_of_mut!(ngx_posted_events));
+                }
+            }
+
+            if !oet {
+                let rc = notify();
+                if rc != 0 {
+                    panic!("pthread_kill: {rc}")
+                }
+            }
         }
     }
 }
 
-impl Drop for SchedulerInner {
+impl Drop for Scheduler {
     fn drop(&mut self) {
-        if self.event.posted() != 0 {
-            unsafe { ngx_delete_posted_event(&mut self.event) };
+        let mut event = self.event.write();
+        if event.posted() != 0 {
+            unsafe { ngx_delete_posted_event(&mut *event) };
         }
 
-        if self.event.timer_set() != 0 {
-            unsafe { ngx_del_timer(&mut self.event) };
+        if event.timer_set() != 0 {
+            unsafe { ngx_del_timer(&mut *event) };
         }
     }
+}
+
+static SCHEDULER: OnceLock<Scheduler> = OnceLock::new();
+
+fn scheduler() -> &'static Scheduler {
+    SCHEDULER.get_or_init(Scheduler::new)
 }
 
 fn schedule(runnable: Runnable, info: ScheduleInfo) {
-    if info.woken_while_running {
-        SCHEDULER.schedule(runnable);
-        ngx_log_debug!(
-            ngx_cycle_log().as_ptr(),
-            "async: task scheduled while running"
-        );
-    } else {
-        runnable.run();
-    }
+    let scheduler = scheduler();
+    scheduler.schedule(runnable, info);
 }
 
 /// Creates a new task running on the NGINX event loop.
@@ -138,10 +138,7 @@ where
     T: 'static,
 {
     ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: spawning new task");
-    let scheduler = WithInfo(schedule);
-    // Safety: single threaded embedding takes care of send/sync requirements for future and
-    // scheduler. Future and scheduler are both 'static.
-    let (runnable, task) = unsafe { async_task::spawn_unchecked(future, scheduler) };
+    let (runnable, task) = unsafe { async_task::spawn_unchecked(future, WithInfo(schedule)) };
     runnable.schedule();
     task
 }
