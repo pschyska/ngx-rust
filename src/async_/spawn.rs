@@ -5,9 +5,9 @@ use std::sync::OnceLock;
 
 use core::future::Future;
 
+use async_task::Runnable;
 pub use async_task::Task;
-use async_task::{Runnable, ScheduleInfo, WithInfo};
-use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_channel::{unbounded, Receiver, Sender};
 use nginx_sys::{ngx_event_actions, ngx_event_t, ngx_thread_tid};
 
 use crate::log::ngx_cycle_log;
@@ -64,19 +64,18 @@ struct Scheduler {
 
 impl Scheduler {
     fn new() -> Self {
-        let (tx, rx) = bounded(1);
+        let (tx, rx) = unbounded();
         Scheduler { tx, rx }
     }
 
-    fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
-        // are we on main thread and not woken_while_running? just .run()…
-        if !info.woken_while_running && on_event_thread() {
+    fn schedule(&self, runnable: Runnable) {
+        // are we on main thread just .run()…
+        if on_event_thread() {
             runnable.run();
         } else {
-            // …otherwise we were called from some other thread, e.g. io handler,
-            // or reentrantly (woken_while_running):
+            // …otherwise we were called from some other thread, e.g. io handler:
             // ngx_notify to interrupt epoll and move it into the event loop
-            self.tx.send(runnable).expect("send_blocking");
+            self.tx.send(runnable).expect("send");
             notify();
         }
     }
@@ -88,9 +87,9 @@ fn scheduler() -> &'static Scheduler {
     SCHEDULER.get_or_init(Scheduler::new)
 }
 
-fn schedule(runnable: Runnable, info: ScheduleInfo) {
+fn schedule(runnable: Runnable) {
     let scheduler = scheduler();
-    scheduler.schedule(runnable, info);
+    scheduler.schedule(runnable);
 }
 
 /// Creates a new task running on the NGINX event loop.
@@ -101,7 +100,7 @@ where
 {
     ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: spawning new task");
     // safe alternative: spawn_local, but this would check tid twice needlessly
-    let (runnable, task) = unsafe { async_task::spawn_unchecked(future, WithInfo(schedule)) };
+    let (runnable, task) = unsafe { async_task::spawn_unchecked(future, schedule) };
     runnable.schedule();
     task
 }
