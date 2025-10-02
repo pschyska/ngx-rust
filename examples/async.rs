@@ -1,6 +1,9 @@
 use async_compat::Compat;
 use futures::future::{self};
 use futures_util::FutureExt;
+use http_body_util::Empty;
+use hyper::body::Bytes;
+use hyper_util::rt::TokioIo;
 use nginx_sys::{ngx_http_core_loc_conf_t, NGX_LOG_ERR};
 use ngx::async_::resolver::Resolver;
 use ngx::async_::{spawn, Task};
@@ -12,13 +15,14 @@ use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::sync::atomic::{AtomicPtr, Ordering};
 use std::task::Poll;
 use std::time::Instant;
+use tokio::net::TcpStream;
 
 use ngx::core::{self, Pool, Status};
 use ngx::ffi::{
     ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_http_handler_pt,
     ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_int_t, ngx_module_t,
-    ngx_post_event, ngx_posted_events, ngx_str_t, ngx_uint_t,
-    NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
+    ngx_post_event, ngx_posted_events, ngx_str_t, ngx_uint_t, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF,
+    NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_EMERG,
 };
 use ngx::http::{self, HTTPStatus, HttpModule, MergeConfigError, Request};
 use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, NgxHttpCoreModule};
@@ -167,16 +171,54 @@ async fn resolve_something(
     )
 }
 
-async fn request_something(uri: &str) -> (String, String) {
+async fn reqwest_something() -> (String, String) {
     let start = Instant::now();
-    let _ = reqwest::get(uri)
+    let _ = reqwest::get("https://example.com")
         .await
         .expect("response")
         .text()
         .await
         .expect("body");
     (
-        format!("X-Request-Time-{uri}"),
+        "X-Reqwest-Time".to_string(),
+        start.elapsed().as_millis().to_string(),
+    )
+}
+
+async fn hyper_something() -> (String, String) {
+    let start = Instant::now();
+    let url = "http://httpbin.org/ip".parse::<hyper::Uri>().expect("uri");
+    let host = url.host().expect("uri has no host");
+    let port = url.port_u16().unwrap_or(80);
+
+    let address = format!("{}:{}", host, port);
+
+    let stream = TcpStream::connect(address).await.expect("connect");
+
+    let io = TokioIo::new(stream);
+
+    // Create the Hyper client
+    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
+        .await
+        .expect("handshake");
+    // Spawn a task to poll the connection, driving the HTTP state
+    let http_task = spawn(async move {
+        if let Err(err) = conn.await {
+            println!("Connection failed: {:?}", err);
+        }
+    });
+    let authority = url.authority().unwrap().clone();
+    let req = hyper::Request::builder()
+        .uri(url)
+        .header(hyper::header::HOST, authority.as_str())
+        .body(Empty::<Bytes>::new())
+        .expect("body");
+    let _ = sender.send_request(req).await.expect("response");
+
+    http_task.cancel().await;
+
+    (
+        "X-Hyper-Time".to_string(),
         start.elapsed().as_millis().to_string(),
     )
 }
@@ -197,8 +239,9 @@ async fn async_access(request: &mut Request) -> Status {
         // yield_now
         Box::pin(waste_yield()),
         // reqwest
-        Box::pin(request_something("https://example.com")),
-        Box::pin(request_something("https://example.org")),
+        Box::pin(reqwest_something()),
+        // hyper
+        Box::pin(hyper_something()),
     ];
     for (header, value) in futures::future::join_all(futs).await {
         request.add_header_out(&header, &value);
