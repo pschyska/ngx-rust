@@ -4,9 +4,9 @@ use futures_util::FutureExt;
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use nginx_sys::{ngx_cycle_t, ngx_http_core_loc_conf_t, NGX_LOG_ERR};
+use nginx_sys::{ngx_http_core_loc_conf_t, NGX_LOG_ERR};
 use ngx::async_::resolver::Resolver;
-use ngx::async_::{initialize_async, spawn, Task};
+use ngx::async_::{spawn, Task};
 use std::cell::RefCell;
 use std::ffi::{c_char, c_void};
 use std::future::Future;
@@ -98,15 +98,8 @@ pub static mut ngx_http_async_module: ngx_module_t = ngx_module_t {
     ctx: std::ptr::addr_of!(NGX_HTTP_ASYNC_MODULE_CTX) as _,
     commands: unsafe { &NGX_HTTP_ASYNC_COMMANDS[0] as *const _ as *mut _ },
     type_: NGX_HTTP_MODULE as _,
-    init_process: Some(init_process),
     ..ngx_module_t::default()
 };
-
-extern "C" fn init_process(_cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    initialize_async();
-
-    Status::NGX_OK.into()
-}
 
 impl http::Merge for ModuleConfig {
     fn merge(&mut self, prev: &ModuleConfig) -> Result<(), MergeConfigError> {
