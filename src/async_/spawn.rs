@@ -1,6 +1,7 @@
 extern crate std;
 
 use core::ffi::c_int;
+use core::sync::atomic::{AtomicI64, Ordering};
 use core::{mem, ptr};
 use std::sync::OnceLock;
 
@@ -10,29 +11,27 @@ pub use async_task::Task;
 use async_task::{Runnable, ScheduleInfo, WithInfo};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use nginx_sys::{
-    ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event, ngx_posted_events,
-    pthread_kill, pthread_self, pthread_t, SIGIO,
+    kill, ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event, ngx_posted_events,
+    ngx_thread_tid, SIGIO,
 };
 
 use crate::log::ngx_cycle_log;
 use crate::ngx_log_debug;
 use crate::sync::RwLock;
 
-static MAIN_THREAD: OnceLock<pthread_t> = OnceLock::new();
-
-/// Initialize async by storing MAIN_THREAD
-pub fn initialize_async() {
-    MAIN_THREAD
-        .set(unsafe { pthread_self() })
-        .expect("async: double initialize")
-}
+static MAIN_TID: AtomicI64 = AtomicI64::new(-1);
 
 #[inline]
 fn on_event_thread() -> bool {
-    *MAIN_THREAD.get().expect("async: not initialized") == unsafe { pthread_self() }
+    let main_tid = MAIN_TID.load(Ordering::Relaxed);
+    let tid: i64 = unsafe { ngx_thread_tid().into() };
+    main_tid == tid
 }
 
 extern "C" fn async_handler(ev: *mut ngx_event_t) {
+    // initialize MAIN_TID on first execution
+    let tid = unsafe { ngx_thread_tid().into() };
+    let _ = MAIN_TID.compare_exchange(-1, tid, Ordering::Relaxed, Ordering::Relaxed);
     let scheduler = scheduler();
     let mut cnt = 0;
     while let Ok(r) = scheduler.rx.try_recv() {
@@ -48,8 +47,8 @@ extern "C" fn async_handler(ev: *mut ngx_event_t) {
 fn notify() -> c_int {
     ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: ngx_notify");
     unsafe {
-        pthread_kill(
-            *MAIN_THREAD.get().expect("async: not initialized"),
+        kill(
+            std::process::id().try_into().unwrap(),
             SIGIO.try_into().unwrap(),
         )
     }
@@ -100,7 +99,7 @@ impl Scheduler {
             if !oet {
                 let rc = notify();
                 if rc != 0 {
-                    panic!("pthread_kill: {rc}")
+                    panic!("kill: {rc}")
                 }
             }
         }
