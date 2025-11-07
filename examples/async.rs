@@ -4,7 +4,7 @@ use futures_util::FutureExt;
 use http_body_util::Empty;
 use hyper::body::Bytes;
 use hyper_util::rt::TokioIo;
-use nginx_sys::{ngx_http_core_loc_conf_t, NGX_LOG_ERR};
+use nginx_sys::{ngx_http_core_loc_conf_t, ngx_thread_tid, NGX_LOG_ERR};
 use ngx::async_::resolver::Resolver;
 use ngx::async_::{spawn, Task};
 use std::cell::RefCell;
@@ -13,9 +13,11 @@ use std::future::Future;
 use std::pin::Pin;
 use std::ptr::{addr_of, addr_of_mut, NonNull};
 use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::OnceLock;
 use std::task::Poll;
 use std::time::Instant;
 use tokio::net::TcpStream;
+use tokio::runtime::Runtime;
 
 use ngx::core::{self, Pool, Status};
 use ngx::ffi::{
@@ -110,144 +112,24 @@ impl http::Merge for ModuleConfig {
     }
 }
 
-fn yield_now() -> impl Future<Output = ()> {
-    let mut yielded = false;
-    future::poll_fn(move |cx| {
-        if std::mem::replace(&mut yielded, true) {
-            Poll::Ready(())
-        } else {
-            cx.waker().wake_by_ref();
-            Poll::Pending
-        }
-    })
-}
-
-async fn waste_yield() -> (String, String) {
-    let start = Instant::now();
-
-    for _ in 0..1000 {
-        yield_now().await;
-    }
-    (
-        "X-Waste-Yield-Time".to_string(),
-        start.elapsed().as_millis().to_string(),
-    )
-}
-
-async fn waste_sleep() -> (String, String) {
-    let start = Instant::now();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    (
-        "X-Waste-Sleep-Time".to_string(),
-        start.elapsed().as_millis().to_string(),
-    )
-}
-
-async fn waste_ngx_sleep() -> (String, String) {
-    let start = Instant::now();
-    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-    (
-        "X-Waste-Ngx-Sleep-Time".to_string(),
-        start.elapsed().as_millis().to_string(),
-    )
-}
-
-async fn resolve_something(
-    clcf: &ngx_http_core_loc_conf_t,
-    pool: &mut Pool,
-    name: &str,
-) -> (String, String) {
-    let start = Instant::now();
-    let resolver = Resolver::from_resolver(NonNull::new(clcf.resolver).expect("resolver"), 30000);
-
-    let _resolution = resolver
-        .resolve_name(unsafe { &ngx_str_t::from_str(pool.as_mut(), name) }, pool)
-        .await
-        .expect("resolution");
-
-    (
-        format!("X-Resolve-Time"),
-        start.elapsed().as_millis().to_string(),
-    )
-}
-
-async fn reqwest_something() -> (String, String) {
-    let start = Instant::now();
-    let _ = reqwest::get("https://example.com")
-        .await
-        .expect("response")
-        .text()
-        .await
-        .expect("body");
-    (
-        "X-Reqwest-Time".to_string(),
-        start.elapsed().as_millis().to_string(),
-    )
-}
-
-async fn hyper_something() -> (String, String) {
-    let start = Instant::now();
-    // see https://hyper.rs/guides/1/client/basic/
-    let url = "http://httpbin.org/ip".parse::<hyper::Uri>().expect("uri");
-    let host = url.host().expect("uri has no host");
-    let port = url.port_u16().unwrap_or(80);
-
-    let address = format!("{}:{}", host, port);
-
-    let stream = TcpStream::connect(address).await.expect("connect");
-
-    let io = TokioIo::new(stream);
-
-    // Create the Hyper client
-    let (mut sender, conn) = hyper::client::conn::http1::handshake(io)
-        .await
-        .expect("handshake");
-    // Spawn a task to poll the connection, driving the HTTP state
-    let http_task = spawn(async move {
-        if let Err(err) = conn.await {
-            println!("Connection failed: {:?}", err);
-        }
+async fn async_access(_request: &mut Request) -> Status {
+    let tid = unsafe { ngx_thread_tid() };
+    println!("!!! async entry, tid={}", tid);
+    let external_task = tokio_runtime().spawn(async {
+        let tid = unsafe { ngx_thread_tid() };
+        println!("!!! external task entry, tid={}", tid);
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        42
     });
-    let authority = url.authority().unwrap().clone();
-    let req = hyper::Request::builder()
-        .uri(url)
-        .header(hyper::header::HOST, authority.as_str())
-        .body(Empty::<Bytes>::new())
-        .expect("body");
-    let _ = sender.send_request(req).await.expect("response");
+    let result = external_task.await;
+    let tid = unsafe { ngx_thread_tid() };
+    println!("!!! async resume, tid={}, result={}", tid, result.unwrap());
 
-    http_task.cancel().await;
+    // await using *this* context, would not move executors or threads
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    let tid = unsafe { ngx_thread_tid() };
+    println!("!!! after await tid={}", tid);
 
-    (
-        "X-Hyper-Time".to_string(),
-        start.elapsed().as_millis().to_string(),
-    )
-}
-
-async fn async_access(request: &mut Request) -> Status {
-    let start = Instant::now();
-    let clcf = NgxHttpCoreModule::location_conf(request).expect("http core loc conf");
-    let mut pool = request.pool();
-
-    // some examples for io and timers
-    let futs: Vec<Pin<Box<dyn futures::Future<Output = (String, String)>>>> = vec![
-        // ngx resolver
-        Box::pin(resolve_something(clcf, &mut pool, "example.com")),
-        // tokio sleep
-        Box::pin(waste_sleep()),
-        // ngx sleep
-        Box::pin(waste_ngx_sleep()),
-        // yield_now
-        Box::pin(waste_yield()),
-        // reqwest
-        Box::pin(reqwest_something()),
-        // hyper
-        Box::pin(hyper_something()),
-    ];
-    for (header, value) in futures::future::join_all(futs).await {
-        request.add_header_out(&header, &value);
-    }
-    request.add_header_out("X-Async-Time", &start.elapsed().as_millis().to_string());
     Status::NGX_OK
 }
 
@@ -330,4 +212,20 @@ extern "C" fn ngx_http_async_commands_set_enable(
     };
 
     ngx::core::NGX_CONF_OK
+}
+
+fn tokio_runtime() -> &'static Runtime {
+    // Should not be called from the master process
+    assert_ne!(
+        unsafe { ngx::ffi::ngx_process },
+        ngx::ffi::NGX_PROCESS_MASTER as _
+    );
+
+    static RUNTIME: OnceLock<Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime init")
+    })
 }

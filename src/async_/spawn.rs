@@ -35,6 +35,9 @@ extern "C" fn async_handler(ev: *mut ngx_event_t) {
     let scheduler = scheduler();
     let mut cnt = 0;
     while let Ok(r) = scheduler.rx.try_recv() {
+
+        let tid = unsafe { ngx_thread_tid() };
+        std::println!("!!! run handler tid={}", tid);
         r.run();
         cnt += 1;
     }
@@ -84,6 +87,8 @@ impl Scheduler {
         // If woken_while_running, it indicates that a task has yielded itself to the Scheduler.
         // Force round-trip via queue to limit reentrancy (skipping SIGIO).
         if oet && !info.woken_while_running {
+            let tid = unsafe { ngx_thread_tid() };
+            std::println!("!!! run eager tid={}", tid);
             runnable.run();
         } else {
             self.tx.send(runnable).expect("send");
@@ -127,6 +132,9 @@ fn scheduler() -> &'static Scheduler {
 
 fn schedule(runnable: Runnable, info: ScheduleInfo) {
     let scheduler = scheduler();
+
+    let tid = unsafe { ngx_thread_tid() };
+    std::println!("!!! schedule tid={}", tid);
     scheduler.schedule(runnable, info);
 }
 
