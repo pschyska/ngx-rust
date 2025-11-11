@@ -11,8 +11,8 @@ pub use async_task::Task;
 use async_task::{Runnable, ScheduleInfo, WithInfo};
 use crossbeam_channel::{unbounded, Receiver, Sender};
 use nginx_sys::{
-    kill, ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event, ngx_posted_events,
-    ngx_thread_tid, SIGIO,
+    kill, ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event,
+    ngx_posted_next_events, ngx_thread_tid, SIGIO,
 };
 
 use crate::log::ngx_cycle_log;
@@ -92,7 +92,7 @@ impl Scheduler {
                 event.log = ngx_cycle_log().as_ptr();
 
                 unsafe {
-                    ngx_post_event(&mut *event, ptr::addr_of_mut!(ngx_posted_events));
+                    ngx_post_event(&mut *event, ptr::addr_of_mut!(ngx_posted_next_events));
                 }
             }
 
