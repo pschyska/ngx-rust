@@ -7,17 +7,14 @@ use std::sync::OnceLock;
 
 use core::future::Future;
 
+use alloc::boxed::Box;
 pub use async_task::Task;
 use async_task::{Runnable, ScheduleInfo, WithInfo};
 use crossbeam_channel::{unbounded, Receiver, Sender};
-use nginx_sys::{
-    kill, ngx_del_timer, ngx_delete_posted_event, ngx_event_t, ngx_post_event,
-    ngx_posted_next_events, ngx_thread_tid, SIGIO,
-};
+use nginx_sys::{kill, ngx_event_t, ngx_post_event, ngx_posted_next_events, ngx_thread_tid, SIGIO};
 
 use crate::log::ngx_cycle_log;
 use crate::ngx_log_debug;
-use crate::sync::RwLock;
 
 static MAIN_TID: AtomicI64 = AtomicI64::new(-1);
 
@@ -40,12 +37,16 @@ extern "C" fn async_handler(ev: *mut ngx_event_t) {
     }
     ngx_log_debug!(
         unsafe { (*ev).log },
-        "async: notify_handler processed {cnt} items"
+        "async: processed {cnt} items"
     );
+
+    unsafe {
+        drop(Box::from_raw(ev));
+    }
 }
 
 fn notify() -> c_int {
-    ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: ngx_notify");
+    ngx_log_debug!(ngx_cycle_log().as_ptr(), "async: notify via SIGIO");
     unsafe {
         kill(
             std::process::id().try_into().unwrap(),
@@ -57,22 +58,12 @@ fn notify() -> c_int {
 struct Scheduler {
     rx: Receiver<Runnable>,
     tx: Sender<Runnable>,
-    event: RwLock<ngx_event_t>,
 }
-
-// Safety: mutable access to event is guarded via RwLock
-unsafe impl Send for Scheduler {}
-unsafe impl Sync for Scheduler {}
 
 impl Scheduler {
     fn new() -> Self {
         let (tx, rx) = unbounded();
-        let mut event: ngx_event_t = unsafe { mem::zeroed() };
-        event.handler = Some(async_handler);
-        event.log = ngx_cycle_log().as_ptr();
-        let event = RwLock::new(event);
-
-        Scheduler { tx, rx, event }
+        Scheduler { tx, rx }
     }
 
     fn schedule(&self, runnable: Runnable, info: ScheduleInfo) {
@@ -87,13 +78,11 @@ impl Scheduler {
             runnable.run();
         } else {
             self.tx.send(runnable).expect("send");
-            {
-                let mut event = self.event.write();
-                event.log = ngx_cycle_log().as_ptr();
-
-                unsafe {
-                    ngx_post_event(&mut *event, ptr::addr_of_mut!(ngx_posted_next_events));
-                }
+            unsafe {
+                let event: *mut ngx_event_t = Box::into_raw(Box::new(mem::zeroed()));
+                (*event).handler = Some(async_handler);
+                (*event).log = ngx_cycle_log().as_ptr();
+                ngx_post_event(event, ptr::addr_of_mut!(ngx_posted_next_events));
             }
 
             if !oet {
@@ -102,19 +91,6 @@ impl Scheduler {
                     panic!("kill: {rc}")
                 }
             }
-        }
-    }
-}
-
-impl Drop for Scheduler {
-    fn drop(&mut self) {
-        let mut event = self.event.write();
-        if event.posted() != 0 {
-            unsafe { ngx_delete_posted_event(&mut *event) };
-        }
-
-        if event.timer_set() != 0 {
-            unsafe { ngx_del_timer(&mut *event) };
         }
     }
 }
