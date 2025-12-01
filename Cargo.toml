@@ -54,6 +54,8 @@ async = [
     "dep:pin-project-lite",
     "dep:crossbeam-channel",
 ]
+# Optimize async notification with eventfd, requires nginx epoll event module
+async_eventfd = ["async"]
 # Provides APIs that require allocations via the `alloc` crate.
 alloc = ["allocator-api2/alloc"]
 # Enables serialization support for some of the provided and re-exported types.

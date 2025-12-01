@@ -7,16 +7,6 @@ use hyper_util::rt::TokioIo;
 use nginx_sys::{ngx_http_core_loc_conf_t, NGX_LOG_ERR};
 use ngx::async_::resolver::Resolver;
 use ngx::async_::{spawn, Task};
-use std::cell::RefCell;
-use std::ffi::{c_char, c_void};
-use std::future::Future;
-use std::pin::Pin;
-use std::ptr::{addr_of, addr_of_mut, NonNull};
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::task::Poll;
-use std::time::Instant;
-use tokio::net::TcpStream;
-
 use ngx::core::{self, Pool, Status};
 use ngx::ffi::{
     ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_http_handler_pt,
@@ -29,6 +19,15 @@ use ngx::http::{HttpModuleLocationConf, HttpModuleMainConf, NgxHttpCoreModule};
 use ngx::{
     http_request_handler, ngx_conf_log_error, ngx_log_debug_http, ngx_log_error, ngx_string,
 };
+use std::cell::RefCell;
+use std::ffi::{c_char, c_void};
+use std::future::Future;
+use std::pin::Pin;
+use std::ptr::{addr_of, addr_of_mut, NonNull};
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::task::Poll;
+use std::time::Instant;
+use tokio::net::TcpStream;
 
 struct Module;
 
@@ -166,7 +165,7 @@ async fn resolve_something(
         .expect("resolution");
 
     (
-        format!("X-Resolve-Time"),
+        "X-Resolve-Time".to_string(),
         start.elapsed().as_millis().to_string(),
     )
 }
@@ -188,7 +187,7 @@ async fn reqwest_something() -> (String, String) {
 async fn hyper_something() -> (String, String) {
     let start = Instant::now();
     // see https://hyper.rs/guides/1/client/basic/
-    let url = "http://httpbin.org/ip".parse::<hyper::Uri>().expect("uri");
+    let url = "https://example.com".parse::<hyper::Uri>().expect("uri");
     let host = url.host().expect("uri has no host");
     let port = url.port_u16().unwrap_or(80);
 
